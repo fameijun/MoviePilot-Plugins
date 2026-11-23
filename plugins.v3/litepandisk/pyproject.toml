@@ -1,0 +1,4 @@
+[project]
+name = "litepandisk"
+dynamic = ["version"]
+requires-python = ">=3.12"
