@@ -31,9 +31,11 @@ from .litepan_client import LitePanAdmin, LitePanClient
 
 
 def _parse_mappings(text: str) -> List[Tuple[str, str]]:
-    """解析路径翻译表：一行一条 ``MP前缀 => LitePan前缀``（也接受单个 =）。"""
+    """解析路径翻译表：一条 ``MP前缀 => LitePan前缀``（也接受单个 =），
+    多条之间用换行、逗号或分号分隔。"""
     mappings: List[Tuple[str, str]] = []
-    for line in (text or "").splitlines():
+    text = (text or "").replace(",", "\n").replace("；", "\n").replace(";", "\n")
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -59,7 +61,7 @@ class LitePanDisk(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "famei"
     # 作者主页
@@ -228,11 +230,11 @@ class LitePanDisk(_PluginBase):
                                 "props": {"cols": 12},
                                 "content": [
                                     {
-                                        "component": "VTextarea",
+                                        "component": "VTextField",
                                         "props": {
                                             "model": "path_mappings",
-                                            "label": "路径翻译（可选，一行一条）",
-                                            "placeholder": "/media/downloads => /vol2/Downloads\n/data/movies => /vol2/Movies",
+                                            "label": "路径翻译（可选，多条用逗号分隔）",
+                                            "placeholder": "/media/downloads => /vol2/Downloads, /data/movies => /vol2/Movies",
                                             "hint": "MoviePilot 本地路径前缀 => LitePan 容器内路径前缀；"
                                                     "不填表示两边挂载路径一致（零拷贝直传）",
                                         },
