@@ -3,11 +3,12 @@
     "name": "LitePan云盘",
     "description": "使存储支持 LitePan 聚合网盘：一个存储入口访问全部网盘账号，上传走零拷贝通道（LitePan 服务器直读源文件，不在其磁盘落盘），账号只需在 LitePan 登录一次。",
     "labels": "存储,网盘,工具",
-    "version": "1.0.3",
+    "version": "1.0.4",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "famei",
     "level": 1,
     "history": {
+      "v1.0.4": "补充 pyproject.toml 插件身份声明",
       "v1.0.3": "源码目录规范修正：目录名=类名小写 litepandisk；ID 与类名 LitePanDisk 对齐",
       "v1.0.0": "首个版本：LitePan 聚合存储 + WebDAV 操作 + 按路径零拷贝上传。",
       "v1.0.1": "配置表单 VTextarea 换为 VTextField（兼容性防御）；路径翻译支持逗号分隔",
