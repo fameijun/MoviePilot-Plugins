@@ -3,11 +3,12 @@
     "name": "LitePan云盘",
     "description": "使存储支持 LitePan 聚合网盘：一个存储入口访问全部网盘账号，上传走零拷贝通道（LitePan 服务器直读源文件，不在其磁盘落盘），账号只需在 LitePan 登录一次。",
     "labels": "存储,网盘,工具",
-    "version": "1.0.7",
+    "version": "1.0.8",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "famei",
     "level": 1,
     "history": {
+      "v1.0.8": "修复部分网盘（115、OneDrive、OpenList 等）整理方式为「复制」时可能产生两份副本的问题：网盘已受理复制但新副本还没出现时不再回退数据中转，等待时间延长到 60 秒",
       "v1.0.7": "同盘整理改为按网盘文件 ID 操作（做法同 p123disk 插件）：插件缓存目录 ID，整理不再经 WebDAV 逐级解析路径，一次同盘整理约 4 次网盘接口调用；不读取环境代理设置；跨账号中转改为带长度的上传并校验是否真的写入",
       "v1.0.6": "修复同盘整理耗时过长：目标目录改为先查后建，只对缺失的层级建目录（MoviePilot 一次同盘移动 19 个请求降到 5 个）；WebDAV 请求增加耗时日志",
       "v1.0.5": "修复同存储（LitePan→LitePan）整理报错：补 is_support_transtype 存储契约（move/copy）",

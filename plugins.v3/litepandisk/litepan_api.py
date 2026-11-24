@@ -50,6 +50,8 @@ class LitePanApi:
     # MoviePilot 存储契约（StorageBase.transtype）：声明的整理方式。
     # 网盘侧支持移动/复制；链接类（link/reflink）远端不适用，交由数据中转或拒绝。
     transtype = {"move": "移动", "copy": "复制"}
+    # 同账号复制后，等新副本在目标目录里出现的时间上限（秒）。
+    copy_visible_seconds = 60.0
 
     def __init__(
         self,
@@ -543,10 +545,14 @@ class LitePanApi:
                 or fileitem.type not in ("file", "dir")):
             return False
         if source[0] == target[0]:
-            ok = self._transfer_within_account(
+            outcome = self._transfer_within_account(
                 fileitem, source, target[1], target_name, delete_source)
-            if ok or delete_source:
-                return ok  # 移动失败不做数据中转，免得中转出错还去删源；复制失败再回退
+            if outcome is None:
+                # 网盘已受理复制，但目标目录里还没看到新副本（可能还在后台复制）。
+                # 这时再中转一份就会重复，所以直接报失败。
+                return False
+            if outcome or delete_source:
+                return outcome  # 移动失败不做数据中转，免得中转出错还去删源；复制失败再回退
             logger.warning(f"【LitePan】网盘侧复制失败，回退数据中转: {fileitem.path}")
         ok = self._transfer_stream(fileitem, self._parts(str(path)), target_name)
         if ok and delete_source:
@@ -554,8 +560,13 @@ class LitePanApi:
         return ok
 
     def _transfer_within_account(self, fileitem: schemas.FileItem, located: Tuple[int, List[str]],
-                                 dst_parts: List[str], target_name: str, delete_source: bool) -> bool:
-        """同账号：网盘侧接口直接移动/复制，不搬数据。"""
+                                 dst_parts: List[str], target_name: str,
+                                 delete_source: bool) -> Optional[bool]:
+        """同账号：网盘侧接口直接移动/复制，不搬数据。
+
+        返回 True 表示完成；False 表示网盘没执行这次操作（复制可以回退数据中转）；
+        None 只在复制时出现：网盘受理了，但新副本还没在目标目录里看到，不能回退。
+        """
         account_id, src_parts = located
         dst_dir = self._resolve(account_id, dst_parts, create=False)
         src_parent = self._resolve(account_id, src_parts[:-1], create=False)
@@ -585,21 +596,31 @@ class LitePanApi:
                     return False
                 fileitem = self._find_new_copy(account_id, dst_dir, fileitem, known)
                 if fileitem is None:
-                    logger.error(f"【LitePan】复制后没在目标目录找到新文件: {dst_dir.path}")
-                    return False
+                    return None
         return self.rename(fileitem, target_name)
 
     def _find_new_copy(self, account_id: int, dst_dir: schemas.FileItem,
                        source: schemas.FileItem, known_ids: set) -> Optional[schemas.FileItem]:
-        """复制后找出新副本：目标目录里与源同名、且不是复制前就在的那些项之一。"""
-        for attempt in range(10):  # 有的网盘复制是异步的，目录列表稍后才看得到
+        """复制后找出新副本：目标目录里与源同名、且不是复制前就在的那些项之一。
+
+        123、光鸭、夸克这些网盘，LitePan 会等复制做完才返回，新副本立刻就在。
+        115、OneDrive、OpenList 的复制则是提交后在后台进行，LitePan 返回时新副本
+        还没出现，这里等它露头。
+        """
+        attempts = max(int(self.copy_visible_seconds / 0.5), 1)
+        for attempt in range(attempts):
             children = self._attempt(lambda: self._children(account_id, dst_dir)) or []
             candidates = [c for c in children if c.name == source.name
                           and c.type == source.type and c.fileid not in known_ids]
             if candidates:
                 return candidates[-1]
-            if attempt < 9:
+            if attempt < attempts - 1:
                 time.sleep(0.5)
+        logger.error(
+            f"【LitePan】网盘已受理复制，但 {self.copy_visible_seconds:.0f} 秒内没在目标目录看到新副本: "
+            f"{dst_dir.path}{source.name}（有的网盘复制在后台进行，稍后才出现；"
+            "为避免出现两份，没有回退数据中转）"
+        )
         return None
 
     def _transfer_stream(self, fileitem: schemas.FileItem, dst_parts: List[str],
