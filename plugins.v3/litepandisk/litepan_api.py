@@ -32,6 +32,10 @@ except ImportError:
 
 
 class LitePanApi:
+    # MoviePilot 存储契约（StorageBase.transtype）：声明的整理方式。
+    # 网盘侧支持移动/复制；链接类（link/reflink）远端不适用，交由数据中转或拒绝。
+    transtype = {"move": "移动", "copy": "复制"}
+
     def __init__(
         self,
         client: LitePanClient,
@@ -276,6 +280,14 @@ class LitePanApi:
         return self._client.move(fileitem.path, dst)
 
     # ------------------------------------------------------------------ 移动/复制
+    def support_transtype(self) -> dict:
+        """MoviePilot 存储契约：当前存储支持的整理方式。"""
+        return self.transtype
+
+    def is_support_transtype(self, transtype: str) -> bool:
+        """MoviePilot 存储契约：同存储远端整理前会先调用此方法做能力判定。"""
+        return transtype in self.transtype
+
     def move(self, fileitem: schemas.FileItem, path, new_name: str = None) -> bool:
         return self._transfer(fileitem, path, new_name, delete_source=True)
 
