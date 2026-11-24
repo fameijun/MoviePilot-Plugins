@@ -1,8 +1,9 @@
 """MoviePilot 存储插件：LitePan 聚合网盘（零拷贝上传）。
 
-向 MoviePilot 注册一个存储「LitePan」：根目录下每个子目录是一个 LitePan 网盘账号，
-浏览/整理/删除/改名等操作经 LitePan WebDAV 执行；上传走 LitePan「按路径上传」
-零拷贝通道（只传路径，LitePan 服务器直读源文件，不在其磁盘落盘）。
+向 MoviePilot 注册一个存储「LitePan」：根目录下每个子目录是一个 LitePan 网盘账号。
+浏览/整理/删除/改名经 LitePan 的接口按网盘文件 ID 执行，插件自己缓存目录 ID，
+整理同盘文件和直接用网盘插件一样快；上传走 LitePan「按路径上传」零拷贝通道
+（只传路径，LitePan 服务器直读源文件，不在其磁盘落盘）。
 账号只在 LitePan 登录一次，MoviePilot 仅保存 LitePan 管理员账密。
 """
 from pathlib import Path
@@ -61,7 +62,7 @@ class LitePanDisk(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     # 插件作者
     plugin_author = "famei"
     # 作者主页

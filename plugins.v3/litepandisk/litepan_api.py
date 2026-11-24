@@ -1,14 +1,21 @@
-"""LitePanApi：实现 MoviePilot 的存储操作契约（对照 guangyadisk 参考插件）。
+"""LitePanApi：实现 MoviePilot 的存储操作契约（做法对照 p123disk 插件）。
 
-路径模型：``/<账号名>/<子路径>``；上传走 LitePan「按路径上传」零拷贝通道
-（litepan 服务器直读本地文件，不在 litepan 落盘、不经本进程搬运数据）。
+路径模型：``/<账号名>/<子路径>``。
+
+整理（列目录、查目标、移动、改名、复制、删除）走 LitePan 的 JSON 接口，按网盘文件 ID
+操作；插件自己缓存「目录路径 → ID」，认识了的目录不再逐级去网盘列目录。早期版本把
+路径交给 WebDAV，LitePan 每个请求都要从账号根目录逐级解析，网盘侧一次整理要等几十秒。
+
+上传走 LitePan「按路径上传」零拷贝通道（litepan 服务器直读本地文件，不在 litepan
+落盘、不经本进程搬运数据）；跨账号整理和下载仍经 WebDAV。
 """
+import threading
 import time
-from hashlib import md5
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
-from .litepan_client import DavItem, LitePanAdmin, LitePanClient
+from .litepan_client import LitePanAdmin, LitePanClient
 
 from app import schemas
 
@@ -31,6 +38,14 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 
+class _QueryError(Exception):
+    """LitePan 查询失败（不等于「确认不存在」）。account_id 指明要清哪个账号的缓存。"""
+
+    def __init__(self, account_id: int, message: str):
+        super().__init__(message)
+        self.account_id = account_id
+
+
 class LitePanApi:
     # MoviePilot 存储契约（StorageBase.transtype）：声明的整理方式。
     # 网盘侧支持移动/复制；链接类（link/reflink）远端不适用，交由数据中转或拒绝。
@@ -51,26 +66,30 @@ class LitePanApi:
         # 路径翻译表：[(MP 本地前缀, litepan 容器内前缀)]；为空表示两边路径一致（恒等直传）。
         self._path_mappings = path_mappings or []
         self._accounts_cache: Optional[List[dict]] = None
+        # 目录缓存：(account_id, "/a/b") → 目录项（fileid 即网盘目录 ID）。
+        # 不过期，只在本插件删改、或查询失败时清理：MoviePilot 的整理目录基本固定，
+        # 认识一次之后就不用再逐级去网盘列目录。
+        self._dirs: Dict[Tuple[int, str], schemas.FileItem] = {}
+        self._lock = threading.RLock()
+        self._account_warned_at = 0.0
 
     # ------------------------------------------------------------------ 工具
     @staticmethod
     def _parts(path: str) -> List[str]:
         return [p for p in str(path).replace("\\", "/").split("/") if p]
 
-    def _account_id_of(self, path: str) -> Optional[int]:
-        parts = self._parts(path)
-        if not parts:
-            return None
-        if self._accounts_cache is None:
-            self._accounts_cache = self._admin.accounts()
-        for acc in self._accounts_cache:
-            if acc.get("name") == parts[0]:
-                return int(acc["id"])
-        self._accounts_cache = self._admin.accounts()  # 可能新建了账号，刷新一次
-        for acc in self._accounts_cache:
-            if acc.get("name") == parts[0]:
-                return int(acc["id"])
-        return None
+    @staticmethod
+    def _dir_key(parts: List[str]) -> str:
+        return "/" + "/".join(parts)
+
+    @staticmethod
+    def _build_path(*segments: str, is_dir: bool = False) -> str:
+        joined = "/" + "/".join(s for s in segments if s)
+        while "//" in joined:
+            joined = joined.replace("//", "/")
+        if is_dir and not joined.endswith("/"):
+            joined += "/"
+        return joined
 
     def _translate(self, local_path: Path) -> Optional[str]:
         """MP 本地路径 → litepan 容器内路径。未配置翻译表=恒等；配了但未命中=配置缺口。"""
@@ -90,6 +109,46 @@ class LitePanApi:
     def _invalidate_accounts(self):
         self._accounts_cache = None
 
+    # ------------------------------------------------------------------ 账号
+    def _accounts(self) -> List[dict]:
+        if self._accounts_cache is None:
+            self._accounts_cache = self._admin.accounts() or []
+        return self._accounts_cache
+
+    def _account_by_name(self, name: str) -> Optional[dict]:
+        found = next((a for a in self._accounts() if a.get("name") == name), None)
+        if found is None:
+            self._accounts_cache = self._admin.accounts() or []  # 可能新建了账号
+            found = next((a for a in self._accounts_cache if a.get("name") == name), None)
+        return found
+
+    def _account_by_id(self, account_id: int) -> Optional[dict]:
+        return next((a for a in self._accounts() if a.get("id") == account_id), None)
+
+    def _locate(self, path) -> Optional[Tuple[int, List[str]]]:
+        """``/<账号名>/...`` → (account_id, 账号内的路径段)。
+
+        存储根返回 (0, [])；账号不存在返回 None。
+        """
+        parts = self._parts(str(path))
+        if not parts:
+            return 0, []
+        account = self._account_by_name(parts[0])
+        if account is None:
+            self._warn_unknown_account(parts[0])
+            return None
+        return int(account.get("id") or 0), parts[1:]
+
+    def _warn_unknown_account(self, name: str):
+        now = time.monotonic()
+        if now - self._account_warned_at < 60:  # 同一分钟内只提示一次
+            return
+        self._account_warned_at = now
+        if self._accounts():
+            logger.warning(f"【LitePan】LitePan 里没有名为「{name}」的账号")
+        else:
+            logger.error("【LitePan】拿不到 LitePan 的账号列表，请检查插件配置的服务地址和管理员账号密码")
+
     # -------------------------------------------------------------- FileItem
     def _root_item(self) -> schemas.FileItem:
         return schemas.FileItem(
@@ -98,124 +157,237 @@ class LitePanApi:
             modify_time=None, thumbnail=None, pickcode=None, drive_id=None,
         )
 
-    def _to_file_item(self, item: DavItem) -> schemas.FileItem:
-        path = item.path
-        name = item.name
-        is_dir = item.is_dir
+    def _account_item(self, account: dict) -> schemas.FileItem:
+        name = str(account.get("name") or "")
+        # 根目录的 ID 用 "0"（LitePan 把 ""、"0" 都当根），避免给 MoviePilot 一个空 fileid。
+        item = schemas.FileItem(
+            storage=self._disk_name, fileid="0", parent_fileid="", name=name,
+            basename=name, extension=None, type="dir", path=f"/{name}/", size=None,
+            modify_time=None, thumbnail=None, pickcode=None, drive_id=None,
+        )
+        self._dirs[(int(account.get("id") or 0), "/")] = item
+        return item
+
+    @staticmethod
+    def _epoch(value) -> Optional[float]:
+        """LitePan 接口里的 RFC3339 时间 → 秒级时间戳；解析不了返回 None。"""
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).strip().replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    def _item_from(self, parent: schemas.FileItem, raw: dict) -> Optional[schemas.FileItem]:
+        name = str(raw.get("name") or "")
+        if not name:
+            return None
+        is_dir = bool(raw.get("is_dir"))
         suffix = Path(name).suffix
-        # etag 缺省时用路径哈希充当 fileid（快照比对用；真实网盘 ID 不外露）。
-        fileid = item.etag or md5(path.encode("utf-8")).hexdigest()
         return schemas.FileItem(
             storage=self._disk_name,
-            fileid=fileid,
-            parent_fileid="",
+            fileid=str(raw.get("id") or ""),
+            parent_fileid=parent.fileid,
             name=name,
             basename=Path(name).stem,
             extension=suffix[1:] if suffix and not is_dir else None,
             type="dir" if is_dir else "file",
-            path=path,
-            size=None if is_dir else item.size,
-            modify_time=item.modify_time,
+            path=parent.path + name + ("/" if is_dir else ""),
+            size=None if is_dir else int(raw.get("size") or 0),
+            modify_time=self._epoch(raw.get("mod_time")),
             thumbnail=None,
             pickcode=None,
             drive_id=None,
         )
 
-    def _build_path(self, *segments: str, is_dir: bool = False) -> str:
-        joined = "/" + "/".join(s for s in segments if s)
-        while "//" in joined:
-            joined = joined.replace("//", "/")
-        if is_dir and not joined.endswith("/"):
-            joined += "/"
-        return joined
+    # ------------------------------------------------------------------ 目录缓存
+    def _dir_cached(self, account_id: int, parts: List[str]) -> Optional[schemas.FileItem]:
+        return self._dirs.get((account_id, self._dir_key(parts)))
+
+    def _forget_under(self, path):
+        """忘掉某路径及其子路径的目录缓存：它被本插件删改过，或在插件外被改动过。"""
+        norm = self._dir_key(self._parts(str(path)))
+        with self._lock:
+            for key in [k for k in self._dirs if k[1] == norm or k[1].startswith(norm + "/")]:
+                del self._dirs[key]
+
+    def _forget_account(self, account_id: int):
+        if not account_id:
+            return
+        with self._lock:
+            for key in [k for k in self._dirs if k[0] == account_id]:
+                del self._dirs[key]
 
     # ------------------------------------------------------------------ 查询
+    def _children(self, account_id: int, parent: schemas.FileItem) -> List[schemas.FileItem]:
+        """列一次目录。失败抛 _QueryError：那是「查不了」，不是「确认不存在」。"""
+        payload = self._admin.list_dir(account_id, parent.fileid)
+        if not payload.get("success"):
+            raise _QueryError(account_id, f"列目录失败 {parent.path}: {payload.get('message')}")
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        return [item for item in (self._item_from(parent, raw) for raw in (data.get("items") or [])
+                                  if isinstance(raw, dict))
+                if item is not None]
+
+    def _attempt(self, fn: Callable[[], object], strict: bool = False):
+        """执行一次查询；失败就清掉该账号的目录缓存重试一次。
+
+        目录可能在插件不知情的时候被删改，缓存里的 ID 已经失效，重试时按路径重新解析。
+        重试仍失败：strict 抛存储查询异常（MoviePilot 据此判定「无法确认」），否则返回 None。
+        """
+        try:
+            return fn()
+        except _QueryError as err:
+            logger.debug(f"【LitePan】{err}，清掉目录缓存后重试")
+            self._forget_account(err.account_id)
+        try:
+            return fn()
+        except _QueryError as err:
+            if strict:
+                raise StorageQueryError(f"【LitePan】无法确认状态: {err}") from err
+            logger.warning(f"【LitePan】{err}")
+            return None
+
+    def _resolve(self, account_id: int, parts: List[str], create: bool):
+        return self._attempt(lambda: self._resolve_dir(account_id, parts, create))
+
+    def _resolve_dir(self, account_id: int, parts: List[str],
+                     create: bool) -> Optional[schemas.FileItem]:
+        """逐级解析目录并返回目录项，只对缓存里没有的层级查询（create 时顺带创建）。
+
+        create=False 且目录不存在、路径中间是文件、或创建失败时返回 None。
+        """
+        with self._lock:
+            if account_id == 0:  # 存储根：下面是各个账号，没有可解析的目录
+                return self._root_item() if not parts else None
+            account = self._account_by_id(account_id)
+            if account is None:
+                raise _QueryError(account_id, f"LitePan 里没有 ID 为 {account_id} 的账号")
+            current = self._dir_cached(account_id, []) or self._account_item(account)
+            for index, name in enumerate(parts):
+                prefix = parts[:index + 1]
+                cached = self._dir_cached(account_id, prefix)
+                if cached is not None:
+                    current = cached
+                    continue
+                children = self._children(account_id, current)
+                found = next((c for c in children if c.type == "dir" and c.name == name), None)
+                if found is None and create:
+                    if any(c.type == "file" and c.name == name for c in children):
+                        return None
+                    found = self._create_dir(account_id, current, name)
+                if found is None:
+                    return None
+                self._dirs[(account_id, self._dir_key(prefix))] = found
+                current = found
+            return current
+
+    def _create_dir(self, account_id: int, parent: schemas.FileItem,
+                    name: str) -> Optional[schemas.FileItem]:
+        payload = self._admin.create_folder(account_id, parent.fileid, name)
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        folder_id = str(data.get("folder_id") or "")
+        if payload.get("success") and folder_id:
+            return schemas.FileItem(
+                storage=self._disk_name, fileid=folder_id, parent_fileid=parent.fileid,
+                name=name, basename=name, extension=None, type="dir",
+                path=parent.path + name + "/", size=None, modify_time=None,
+                thumbnail=None, pickcode=None, drive_id=None,
+            )
+        # 没建成：可能刚被别的线程建好，或网盘那边已有同名目录而列表还没刷新。再列一次父目录确认。
+        return next((c for c in self._children(account_id, parent)
+                     if c.type == "dir" and c.name == name), None)
+
+    def _mutate(self, fileitem: schemas.FileItem, action: Callable[[str], bool]) -> bool:
+        """按文件 ID 执行一次写操作；失败时按路径重新解析 ID 再试一次。
+
+        MoviePilot 回放的旧任务可能带着早期版本插件生成的 fileid；目录也可能在插件外被
+        删改过。文件 ID 就是路径的存储（如本机存储）移动后 ID 会变，也靠这里补救。
+        """
+        if action(fileitem.fileid or ""):
+            return True
+        self._forget_under(fileitem.path)
+        fresh = self.get_item(fileitem.path)
+        if fresh is None or fresh.fileid == fileitem.fileid:
+            return False
+        return bool(action(fresh.fileid))
+
+    def _query_item(self, path) -> Optional[schemas.FileItem]:
+        """按路径查文件/目录项：列一次父目录取最新状态（父目录链走缓存，不再逐级查询）。
+
+        不直接返回缓存里的目录项：目录可能在插件外被删改，查到的必须是现在的样子。
+        """
+        located = self._locate(path)
+        if located is None:
+            return None
+        account_id, parts = located
+        if account_id == 0:
+            return self._root_item()
+        account = self._account_by_id(account_id)
+        if account is None:
+            raise _QueryError(account_id, f"LitePan 里没有 ID 为 {account_id} 的账号")
+        if not parts:
+            return self._account_item(account)
+        parent = self._resolve_dir(account_id, parts[:-1], create=False)
+        if parent is None:
+            return None
+        return next((c for c in self._children(account_id, parent) if c.name == parts[-1]), None)
+
+    def _list_dir(self, account_id: int, parts: List[str]) -> Optional[List[schemas.FileItem]]:
+        dir_item = self._resolve_dir(account_id, parts, create=False)
+        if dir_item is None:
+            return None
+        return self._children(account_id, dir_item)
+
     def list(self, fileitem: schemas.FileItem, page: int = 0,
              page_size: int = 100) -> List[schemas.FileItem]:
-        try:
-            items, _status = self._client.propfind(fileitem.path, depth=1)
-        except RuntimeError:
+        if fileitem.type == "file":
+            item = self.get_item(fileitem.path)
+            return [item] if item is not None else []
+        located = self._locate(fileitem.path)
+        if located is None:
             return []
-        if not items:
-            return []
-        base = fileitem.path.rstrip("/")
-        out = []
-        for it in items:
-            if it.path.rstrip("/") == base:
-                continue
-            out.append(self._to_file_item(it))
-        return out
-
-    def _stat(self, path) -> Tuple[Optional[List[DavItem]], Optional[int]]:
-        return self._client.propfind(str(path), depth=0)
+        account_id, parts = located
+        if account_id == 0:
+            return [self._account_item(account) for account in self._accounts()]
+        # 解析目录和列目录放在同一次尝试里：目录缓存过期时，重试会按路径重新解析。
+        return self._attempt(lambda: self._list_dir(account_id, parts)) or []
 
     def get_item(self, path) -> Optional[schemas.FileItem]:
-        if self._parts(str(path)) == [] or str(path) == "/":
-            return self._root_item()
-        try:
-            items, _status = self._stat(path)
-        except RuntimeError:
-            return None
-        if not items:
-            return None
-        return self._to_file_item(items[0])
+        return self._attempt(lambda: self._query_item(path))
 
     def get_item_strict(self, path) -> Optional[schemas.FileItem]:
-        if self._parts(str(path)) == [] or str(path) == "/":
-            return self._root_item()
-        try:
-            items, _status = self._stat(path)
-        except RuntimeError as err:
-            raise StorageQueryError(f"无法确认 {path} 的状态: {err}")
-        if not items:
-            return None
-        return self._to_file_item(items[0])
+        return self._attempt(lambda: self._query_item(path), strict=True)
 
     def get_folder(self, path) -> Optional[schemas.FileItem]:
-        """确保目录存在并返回目录项。
-
-        先查整条路径，已存在直接返回；不存在时从深到浅找到最高的缺失层级，只对缺失
-        的层级 MKCOL。MoviePilot 一次整理会对同一目标目录调用两次本方法，旧实现逐级
-        MKCOL，而已存在目录的 MKCOL 会让 LitePan 照样向网盘发一次建目录请求。
-        """
-        parts = self._parts(str(path))
-        if not parts:
-            return self._root_item()
-        item = self.get_item(self._build_path(*parts, is_dir=True))
-        if item is not None:
-            return item if item.type == "dir" else None
-
-        missing: List[str] = []
-        found = 0
-        for end in range(len(parts), 0, -1):
-            if end < len(parts):
-                probe = self.get_item(self._build_path(*parts[:end], is_dir=True))
-                if probe is not None:
-                    if probe.type != "dir":
-                        return None
-                    found = end
-                    break
-            missing.append(parts[end - 1])
-        if not found:
-            return None  # 连账号根目录都查不到，不往下建目录
-        for name in reversed(missing):
-            found += 1
-            if not self._client.mkcol(self._build_path(*parts[:found - 1], name, is_dir=True)):
-                return None
-        return self.get_item(self._build_path(*parts, is_dir=True))
+        """确保目录存在并返回目录项。各级目录认识过一次之后就不再查询，缺失的层级才创建。"""
+        located = self._locate(path)
+        if located is None:
+            return None
+        dir_item = self._resolve(located[0], located[1], create=True)
+        return dir_item if dir_item is not None and dir_item.type == "dir" else None
 
     def create_folder(self, fileitem: schemas.FileItem, name: str) -> Optional[schemas.FileItem]:
-        parts = self._parts(fileitem.path)
-        name = str(name).strip()
-        if not parts or not name:
+        name = str(name or "").strip()
+        located = self._locate(fileitem.path)
+        if located is None or located[0] == 0 or not name:
+            return None  # 存储根下是账号，不能建目录
+        account_id, parts = located
+        with self._lock:
+            return self._attempt(lambda: self._create_under(account_id, parts, name))
+
+    def _create_under(self, account_id: int, parts: List[str], name: str) -> Optional[schemas.FileItem]:
+        parent = self._resolve_dir(account_id, parts, create=False)
+        if parent is None:
             return None
-        target = self._build_path(*parts, name, is_dir=True)
-        existing = self.get_item(target)  # 同名目录已存在时直接复用，不再让网盘重复创建
+        existing = next((c for c in self._children(account_id, parent) if c.name == name), None)
         if existing is not None:
+            # 同名目录已存在：直接复用，不让网盘再建一个；同名的是文件则没办法建。
             return existing if existing.type == "dir" else None
-        if not self._client.mkcol(target):
-            return None
-        return self.get_item(target)
+        created = self._create_dir(account_id, parent, name)
+        if created is not None:
+            self._dirs[(account_id, self._dir_key(parts + [name]))] = created
+        return created
 
     def get_parent(self, fileitem: schemas.FileItem) -> Optional[schemas.FileItem]:
         path = fileitem.path.rstrip("/")
@@ -249,13 +421,13 @@ class LitePanApi:
                 "（或让 MoviePilot 与 LitePan 容器使用相同挂载路径）。"
             )
             return None
-        account_id = self._account_id_of(target_dir.path)
-        if account_id is None:
+        located = self._locate(target_dir.path)
+        if located is None or located[0] == 0:
             logger.error(f"【LitePan】找不到目标账号: {self._parts(target_dir.path)[:1]}")
             return None
-        dir_parts = self._parts(target_dir.path)[1:]
-        dir_id = self._admin.resolve_dir_id(account_id, dir_parts)
-        if dir_id is None and dir_parts:
+        account_id, dir_parts = located
+        dir_item = self._resolve(account_id, dir_parts, create=False)
+        if dir_item is None:
             logger.error(f"【LitePan】目标目录不存在: {target_dir.path}")
             return None
 
@@ -264,7 +436,7 @@ class LitePanApi:
         task_id = LitePanAdmin.new_task_id()
         payload = self._admin.upload_by_path(
             account_id=account_id,
-            target_path=dir_id or "",
+            target_path=dir_item.fileid,
             items=[{"path": server_path, "is_dir": is_dir, "rel_path": rel_path}],
             client_task_id=task_id,
             target_display_path=str(target_dir.path),
@@ -285,26 +457,67 @@ class LitePanApi:
             )
             return None
 
-        remote_name = rel_path or local_path.name
+        # 上传单个文件时，任务结果里直接带网盘文件 ID，不用再去查一遍目录。
+        # 上传目录时结果里记的是目录内部的文件，目录本身按名字到目标目录里找。
+        result = task.get("result") if isinstance(task.get("result"), dict) else {}
+        remote_name = str((not is_dir and result.get("file_name")) or rel_path or local_path.name)
         remote = self._build_path(*self._parts(target_dir.path), remote_name, is_dir=is_dir)
-        item = self.get_item(remote)
-        for _ in range(10):  # 目录树较大时可见性有延迟
-            if item is not None:
-                break
-            time.sleep(0.5)
-            item = self.get_item(remote)
+        file_id = "" if is_dir else str(result.get("file_id") or "")
+        if file_id:
+            suffix = Path(remote_name).suffix
+            size = result.get("size")
+            item = schemas.FileItem(
+                storage=self._disk_name, fileid=file_id, parent_fileid=dir_item.fileid,
+                name=remote_name, basename=Path(remote_name).stem,
+                extension=suffix[1:] if suffix and not is_dir else None,
+                type="dir" if is_dir else "file", path=remote,
+                size=None if is_dir or size is None else int(size),
+                modify_time=None, thumbnail=None, pickcode=None, drive_id=None,
+            )
+        else:
+            item = None
+            for _ in range(10):  # 目录树较大时可见性有延迟
+                item = self.get_item(remote)
+                if item is not None:
+                    break
+                time.sleep(0.5)
+        if is_dir and item is not None and item.type == "dir":
+            self._dirs[(account_id, self._dir_key(dir_parts + [remote_name]))] = item
         return item
 
     # ------------------------------------------------------------------ 删除/改名
     def delete(self, fileitem: schemas.FileItem) -> bool:
-        return self._client.delete(fileitem.path)
+        located = self._locate(fileitem.path)
+        if located is None or not located[1]:
+            return False
+        account_id, parts = located
+        parent = self._resolve(account_id, parts[:-1], create=False)
+        if parent is None:
+            return False
+        ok = self._mutate(
+            fileitem,
+            lambda file_id: self._admin.delete_files(account_id, [file_id], parent.fileid),
+        )
+        if ok:
+            self._forget_under(fileitem.path)
+        return ok
 
     def rename(self, fileitem: schemas.FileItem, name: str) -> bool:
-        parts = self._parts(fileitem.path)
-        if len(parts) < 2:
+        name = str(name or "").strip()
+        located = self._locate(fileitem.path)
+        if located is None or not located[1] or not name:
             return False
-        dst = self._build_path(*parts[:-1], name, is_dir=fileitem.type == "dir")
-        return self._client.move(fileitem.path, dst)
+        if name == fileitem.name:
+            return True
+        account_id, parts = located
+        parent = self._resolve(account_id, parts[:-1], create=False)
+        if parent is None:
+            return False
+        if not self._mutate(fileitem, lambda file_id: self._admin.rename_file(
+                account_id, file_id, name, parent.fileid)):
+            return False
+        self._forget_under(fileitem.path)
+        return True
 
     # ------------------------------------------------------------------ 移动/复制
     def support_transtype(self) -> dict:
@@ -323,46 +536,71 @@ class LitePanApi:
 
     def _transfer(self, fileitem: schemas.FileItem, path, new_name: Optional[str],
                   delete_source: bool) -> bool:
-        src_parts = self._parts(fileitem.path)
-        dst_parts = self._parts(str(path))
-        if len(src_parts) < 2 or len(dst_parts) < 1:
+        source = self._locate(fileitem.path)
+        target = self._locate(path)
+        target_name = str(new_name or fileitem.name).strip()
+        if (source is None or target is None or not source[1] or not target_name
+                or fileitem.type not in ("file", "dir")):
             return False
-        target_name = new_name or fileitem.name
-        if src_parts[0] == dst_parts[0]:
-            # 同账号：网盘侧 API（rename/move 秒级；copy 走服务端复制）。
-            dst = self._build_path(*dst_parts, target_name, is_dir=fileitem.type == "dir")
-            if delete_source:
-                return self._client.move(fileitem.path, dst)
-            if self._copy_within_account(fileitem, dst_parts, target_name):
-                return True
+        if source[0] == target[0]:
+            ok = self._transfer_within_account(
+                fileitem, source, target[1], target_name, delete_source)
+            if ok or delete_source:
+                return ok  # 移动失败不做数据中转，免得中转出错还去删源；复制失败再回退
             logger.warning(f"【LitePan】网盘侧复制失败，回退数据中转: {fileitem.path}")
-        ok = self._transfer_stream(fileitem, dst_parts, target_name)
+        ok = self._transfer_stream(fileitem, self._parts(str(path)), target_name)
         if ok and delete_source:
-            self._client.delete(fileitem.path)
+            self.delete(fileitem)
         return ok
 
-    def _copy_within_account(self, fileitem: schemas.FileItem, dst_parts: List[str],
-                             target_name: str) -> bool:
-        """同账号复制：解析真实网盘 ID 后调 LitePan 的 copy 接口（服务端网盘侧复制）。"""
-        account_id = self._account_id_of(fileitem.path)
-        if account_id is None:
+    def _transfer_within_account(self, fileitem: schemas.FileItem, located: Tuple[int, List[str]],
+                                 dst_parts: List[str], target_name: str, delete_source: bool) -> bool:
+        """同账号：网盘侧接口直接移动/复制，不搬数据。"""
+        account_id, src_parts = located
+        dst_dir = self._resolve(account_id, dst_parts, create=False)
+        src_parent = self._resolve(account_id, src_parts[:-1], create=False)
+        if dst_dir is None or src_parent is None:
             return False
-        src_parts = self._parts(fileitem.path)
-        item_id, parent_id, _is_dir = self._admin.resolve_item(account_id, src_parts[1:])
-        if item_id is None:
-            return False
-        target_parent = self._admin.resolve_dir_id(account_id, dst_parts[1:]) if len(dst_parts) > 1 else ""
-        if target_parent is None:
-            return False
-        if not self._admin.copy_files(account_id, item_id, target_parent, parent_id):
-            return False
-        if target_name != fileitem.name:
-            # 网盘侧 copy 保留原名：先取原名副本再改名成目标名。
-            copied = self.get_item(self._build_path(*dst_parts, fileitem.name,
-                                                    is_dir=fileitem.type == "dir"))
-            if copied is not None:
-                return self.rename(copied, target_name)
-        return True
+        if dst_dir.fileid != src_parent.fileid:
+            if delete_source:
+                if not self._mutate(fileitem, lambda file_id: self._admin.move_files(
+                        account_id, [file_id], dst_dir.fileid, src_parent.fileid)):
+                    return False
+                self._forget_under(fileitem.path)
+                # 网盘侧移动保留原名：接下来在目标目录里按原名找到它，再改成目标名。
+                is_dir = fileitem.type == "dir"
+                fileitem = schemas.FileItem(
+                    storage=self._disk_name, fileid=fileitem.fileid, parent_fileid=dst_dir.fileid,
+                    name=fileitem.name, basename=Path(fileitem.name).stem,
+                    extension=fileitem.extension, type=fileitem.type,
+                    path=dst_dir.path + fileitem.name + ("/" if is_dir else ""),
+                    size=fileitem.size, modify_time=fileitem.modify_time,
+                    thumbnail=None, pickcode=None, drive_id=None,
+                )
+            else:
+                known = {c.fileid for c in (self._attempt(
+                    lambda: self._children(account_id, dst_dir)) or [])}
+                if not self._mutate(fileitem, lambda file_id: self._admin.copy_files(
+                        account_id, [file_id], dst_dir.fileid, src_parent.fileid)):
+                    return False
+                fileitem = self._find_new_copy(account_id, dst_dir, fileitem, known)
+                if fileitem is None:
+                    logger.error(f"【LitePan】复制后没在目标目录找到新文件: {dst_dir.path}")
+                    return False
+        return self.rename(fileitem, target_name)
+
+    def _find_new_copy(self, account_id: int, dst_dir: schemas.FileItem,
+                       source: schemas.FileItem, known_ids: set) -> Optional[schemas.FileItem]:
+        """复制后找出新副本：目标目录里与源同名、且不是复制前就在的那些项之一。"""
+        for attempt in range(10):  # 有的网盘复制是异步的，目录列表稍后才看得到
+            children = self._attempt(lambda: self._children(account_id, dst_dir)) or []
+            candidates = [c for c in children if c.name == source.name
+                          and c.type == source.type and c.fileid not in known_ids]
+            if candidates:
+                return candidates[-1]
+            if attempt < 9:
+                time.sleep(0.5)
+        return None
 
     def _transfer_stream(self, fileitem: schemas.FileItem, dst_parts: List[str],
                          target_name: str) -> bool:
@@ -377,11 +615,9 @@ class LitePanApi:
         src = self._client.stream(fileitem.path)
         if src is None:
             return False
-        dst = self._build_path(*dst_parts, target_name)
-        if not self._client.put_stream(dst, src):
-            src.close()
-            return False
-        return True
+        ok = self._client.put_stream(self._build_path(*dst_parts, target_name), src)
+        src.close()
+        return ok
 
     # ------------------------------------------------------------------ 快照/用量
     def snapshot(self, fileitem: schemas.FileItem) -> List[schemas.FileItem]:

@@ -1,15 +1,15 @@
-"""LitePan HTTP 客户端：WebDAV（文件操作）+ 管理 JSON API（登录/零拷贝上传）。
+"""LitePan HTTP 客户端：管理 JSON API（登录、按 ID 的文件操作、零拷贝上传）+ WebDAV。
 
 路径模型：MP 侧统一使用虚拟路径 ``/<账号名>/<子路径>...``，与 LitePan WebDAV
 ``/dav/<账号名>/...`` 一一对应（客户端内部自动加 /dav 前缀与 URL 编码）。
+整理走 JSON 接口、按网盘文件 ID 操作；WebDAV 只用于下载和跨账号数据中转。
 """
+import threading
 import time
 import uuid
-import xml.etree.ElementTree as ET
-from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, unquote, urlsplit
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -20,26 +20,62 @@ except ImportError:
 
     logger = logging.getLogger(__name__)
 
-DAV_NS = "{DAV:}"
 # 终态：与 litepan upload 包的状态常量对齐。
 UPLOAD_TERMINAL_STATUS = {"success", "failed", "canceled", "skipped"}
 CHUNK_SIZE = 10 * 1024 * 1024
+# 请求耗时全部记 DEBUG，超过该秒数的另记一条 INFO，
+# 这样从 MoviePilot 日志就能直接看出一次整理慢在哪个请求上。
+SLOW_REQUEST_SECONDS = 3.0
 
 
-class DavItem:
-    """PROPFIND 解析结果。path 为虚拟路径（目录带尾斜杠）。"""
+def log_timing(label: str, elapsed: float):
+    if logger is None:
+        return
+    line = f"【LitePan】{label} 耗时 {elapsed:.2f}s"
+    if elapsed >= SLOW_REQUEST_SECONDS:
+        logger.info(line)
+    else:
+        logger.debug(line)
 
-    __slots__ = ("name", "path", "is_dir", "size", "modify_time", "etag")
 
-    def __init__(self, name: str, path: str, is_dir: bool,
-                 size: Optional[int] = None, modify_time: Optional[float] = None,
-                 etag: Optional[str] = None):
-        self.name = name
-        self.path = path
-        self.is_dir = is_dir
-        self.size = size
-        self.modify_time = modify_time
-        self.etag = etag
+def _new_session() -> requests.Session:
+    """发往 LitePan（局域网）的会话：不读环境里的代理和 netrc 设置。
+
+    MoviePilot 容器里常为了访问外部站点配了 HTTP_PROXY，默认情况下 requests 会连发往
+    LitePan 的请求也绕道代理，多一层转发，还可能出错。
+    """
+    session = requests.Session()
+    session.trust_env = False
+    return session
+
+
+class SizedBody:
+    """把流式响应包装成带长度的文件式请求体。
+
+    直接拿 iter_content() 当请求体会走分块传输；有的代理不转发分块体，而 LitePan 对空
+    请求体照样回 201（什么都不写），看上去传成功了，文件却不存在。带上 Content-Length
+    就和普通文件上传走同一条路。
+    """
+
+    def __init__(self, response: requests.Response, length: int):
+        self.length = length
+        self._chunks = response.iter_content(chunk_size=CHUNK_SIZE)
+        self._buffer = b""
+
+    def __len__(self) -> int:
+        return self.length
+
+    def read(self, size: int = -1) -> bytes:
+        while size < 0 or len(self._buffer) < size:
+            try:
+                self._buffer += next(self._chunks)
+            except StopIteration:
+                break
+        if size < 0:
+            data, self._buffer = self._buffer, b""
+        else:
+            data, self._buffer = self._buffer[:size], self._buffer[size:]
+        return data
 
 
 class LitePanClient:
@@ -49,7 +85,7 @@ class LitePanClient:
         self.base_url = base_url.rstrip("/")
         self.dav_base = self.base_url + "/dav"
         self.timeout = timeout
-        self.session = requests.Session()
+        self.session = _new_session()
         self.session.auth = (username, password)
 
     def close(self):
@@ -71,94 +107,16 @@ class LitePanClient:
     def _url(self, path: str) -> str:
         return self.dav_base + quote(self.normalize_path(path))
 
-    @staticmethod
-    def _href_to_path(href: str) -> str:
-        """响应 href（URL 编码、含 /dav 前缀）→ 虚拟路径。"""
-        path = unquote(urlsplit(href).path)
-        prefix = "/dav"
-        if path.startswith(prefix):
-            path = path[len(prefix):]
-        return path or "/"
-
     # ------------------------------------------------------------- 请求与耗时
-    # 元数据/写操作请求全部记 DEBUG 耗时，超过 slow_request_seconds 的另记一条 INFO，
-    # 这样从 MoviePilot 日志就能直接看出一次整理慢在哪个请求上。
-    slow_request_seconds = 3.0
-
     def _dav_request(self, method: str, path: str, **kwargs) -> requests.Response:
         started = time.monotonic()
         try:
             resp = self.session.request(method, self._url(path), **kwargs)
         except requests.RequestException:
-            self._log_dav_timing(method, path, started, None)
+            log_timing(f"{method} {self.normalize_path(path)} 网络错误", time.monotonic() - started)
             raise
-        self._log_dav_timing(method, path, started, resp.status_code)
+        log_timing(f"{method} {self.normalize_path(path)} {resp.status_code}", time.monotonic() - started)
         return resp
-
-    def _log_dav_timing(self, method: str, path: str, started: float, status: Optional[int]):
-        if logger is None:
-            return
-        elapsed = time.monotonic() - started
-        line = (f"【LitePan】{method} {self.normalize_path(path)} "
-                f"{status if status is not None else '网络错误'} 耗时 {elapsed:.2f}s")
-        if elapsed >= self.slow_request_seconds:
-            logger.info(line)
-        else:
-            logger.debug(line)
-
-    # -------------------------------------------------------------- PROPFIND
-    def propfind(self, path: str, depth: int = 0) -> Tuple[Optional[List[DavItem]], Optional[int]]:
-        """返回 (items, status)：200 → items（含自身）；404 → (None, 404)；其它 → (None, code)。"""
-        try:
-            resp = self._dav_request(
-                "PROPFIND", path,
-                headers={"Depth": str(depth), "Content-Type": "application/xml"},
-                data='<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop>'
-                     '<D:displayname/><D:resourcetype/><D:getcontentlength/>'
-                     '<D:getlastmodified/><D:getetag/></D:prop></D:propfind>',
-                timeout=self.timeout,
-            )
-        except requests.RequestException as err:
-            raise RuntimeError(f"LitePan WebDAV 请求失败: {err}") from err
-        if resp.status_code == 404:
-            return None, 404
-        if resp.status_code != 207:
-            return None, resp.status_code
-        return self._parse_multistatus(resp.content), 207
-
-    def _parse_multistatus(self, content: bytes) -> List[DavItem]:
-        items: List[DavItem] = []
-        root = ET.fromstring(content)
-        for response in root.iter(f"{DAV_NS}response"):
-            href_el = response.find(f"{DAV_NS}href")
-            if href_el is None or not href_el.text:
-                continue
-            path = self._href_to_path(href_el.text.strip())
-            prop = response.find(f"{DAV_NS}propstat/{DAV_NS}prop")
-            if prop is None:
-                continue
-            is_dir = prop.find(f"{DAV_NS}resourcetype/{DAV_NS}collection") is not None
-            name = path.rstrip("/").rpartition("/")[2] or "/"
-            size: Optional[int] = None
-            length_el = prop.find(f"{DAV_NS}getcontentlength")
-            if length_el is not None and length_el.text and not is_dir:
-                try:
-                    size = int(length_el.text)
-                except ValueError:
-                    size = None
-            modify_time: Optional[float] = None
-            mtime_el = prop.find(f"{DAV_NS}getlastmodified")
-            if mtime_el is not None and mtime_el.text:
-                try:
-                    modify_time = parsedate_to_datetime(mtime_el.text).timestamp()
-                except (TypeError, ValueError):
-                    modify_time = None
-            etag_el = prop.find(f"{DAV_NS}getetag")
-            etag = etag_el.text.strip() if etag_el is not None and etag_el.text else None
-            if is_dir and not path.endswith("/"):
-                path += "/"
-            items.append(DavItem(name, path, is_dir, size, modify_time, etag))
-        return items
 
     # ----------------------------------------------------------------- 写操作
     def mkcol(self, path: str) -> bool:
@@ -167,22 +125,6 @@ class LitePanClient:
         except requests.RequestException:
             return False
         return resp.status_code in (200, 201, 405)  # 405=已存在（LitePan 对建目录出错也回 405）
-
-    def delete(self, path: str) -> bool:
-        try:
-            resp = self._dav_request("DELETE", path, timeout=self.timeout)
-        except requests.RequestException:
-            return False
-        return resp.status_code in (200, 204, 404)
-
-    def move(self, src: str, dst: str) -> bool:
-        """同账号 MOVE（网盘侧 rename/move API，不搬数据）。dst 已存在时不覆盖（412）。"""
-        headers = {"Destination": self._url(dst), "Overwrite": "F"}
-        try:
-            resp = self._dav_request("MOVE", src, headers=headers, timeout=self.timeout)
-        except requests.RequestException:
-            return False
-        return resp.status_code in (200, 201, 204)
 
     # ----------------------------------------------------------------- 数据流
     def download(self, path: str, local_path, stop_check=None) -> Optional[Path]:
@@ -215,31 +157,51 @@ class LitePanClient:
         return resp if resp.status_code == 200 else None
 
     def put_stream(self, path: str, source: requests.Response) -> bool:
-        """把源流写到目标（跨账号中转用）。"""
+        """把源流写到目标（跨账号中转用）。
+
+        源响应给了 Content-Length 就按长度流式上传；没给（长度未知）才退回分块传输。
+        """
         try:
-            resp = self.session.put(
-                self._url(path), data=source.iter_content(chunk_size=CHUNK_SIZE),
-                timeout=self.timeout)
-            return resp.status_code in (200, 201, 204)
+            length = int(source.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length > 0:
+            body = SizedBody(source, length)
+        elif source.headers.get("Content-Length") is not None:
+            return False  # 源文件是空的：LitePan 对空请求体也回 201，但什么都不会写
+        else:
+            body = source.iter_content(chunk_size=CHUNK_SIZE)
+        try:
+            resp = self.session.put(self._url(path), data=body, timeout=self.timeout)
         except requests.RequestException:
             return False
+        # 真正写入时 LitePan 会带 ETag 返回；只回了状态码说明请求体没到。
+        return resp.status_code in (200, 201, 204) and bool(resp.headers.get("ETag"))
 
 
 class LitePanAdmin:
-    """LitePan 管理 JSON API：cookie session 登录 + 零拷贝上传。"""
+    """LitePan 管理 JSON API：cookie session 登录、按 ID 的文件操作、零拷贝上传。"""
 
     def __init__(self, base_url: str, username: str, password: str, timeout: int = 60):
         self.base_url = base_url.rstrip("/") + "/api"
         self.username = username
         self.password = password
         self.timeout = timeout
-        self.session = requests.Session()
+        self.session = _new_session()
         self._logged_in = False
+        self._login_lock = threading.Lock()
 
     def close(self):
         self.session.close()
 
     def _login(self) -> bool:
+        # 多个线程同时撞上会话过期时只登录一次，其余线程等它登完直接复用。
+        with self._login_lock:
+            if self._logged_in:
+                return True
+            return self._do_login()
+
+    def _do_login(self) -> bool:
         try:
             resp = self.session.post(
                 f"{self.base_url}/auth/login",
@@ -261,6 +223,13 @@ class LitePanAdmin:
         """带 401 重登的请求，返回响应 JSON dict；失败返回 {"success": False, ...}。"""
         url = f"{self.base_url}{path}"
         kwargs.setdefault("timeout", self.timeout)
+        started = time.monotonic()
+        payload = self._request_with_relogin(method, url, **kwargs)
+        log_timing(f"{method} /api{path} {'成功' if payload.get('success') else '失败'}",
+                   time.monotonic() - started)
+        return payload
+
+    def _request_with_relogin(self, method: str, url: str, **kwargs) -> Dict[str, Any]:
         for attempt in range(2):
             try:
                 resp = self.session.request(method, url, **kwargs)
@@ -296,47 +265,38 @@ class LitePanAdmin:
             params["force_refresh"] = "true"
         return self._request("GET", "/files/list", params=params)
 
-    def resolve_dir_id(self, account_id: int, dir_parts: List[str]) -> Optional[str]:
-        """按路径逐级解析网盘目录 ID；不存在返回 None。空 parts 返回根 parent（空串）。"""
-        parent_id = ""
-        for name in dir_parts:
-            payload = self.list_dir(account_id, parent_id, force=True)
-            if not payload.get("success"):
-                return None
-            items = (payload.get("data") or {}).get("items") or []
-            matched = next((it for it in items
-                            if it.get("is_dir") and it.get("name") == name), None)
-            if matched is None:
-                return None
-            parent_id = str(matched.get("id") or "")
-        return parent_id
+    # -------------------------------------------------------------- 文件操作
+    # 都按网盘文件 ID 操作。parent_id 一并传给 LitePan，它据此失效对应目录的列表缓存。
+    def create_folder(self, account_id: int, parent_id: str, name: str) -> Dict[str, Any]:
+        """建目录；成功时 data 里带 folder_id。"""
+        return self._request("POST", "/files/create-folder", json={
+            "account_id": account_id, "parent_id": parent_id or "", "name": name})
 
-    def resolve_item(self, account_id: int, parts: List[str]):
-        """解析路径末段（可为文件）→ (item_id, parent_id, is_dir)；不存在返回 (None, None, False)。"""
-        if not parts:
-            return "", "", True
-        *dir_parts, name = parts
-        parent_id = self.resolve_dir_id(account_id, dir_parts)
-        if parent_id is None:
-            return None, None, False
-        payload = self.list_dir(account_id, parent_id, force=True)
-        if not payload.get("success"):
-            return None, None, False
-        items = (payload.get("data") or {}).get("items") or []
-        matched = next((it for it in items if it.get("name") == name), None)
-        if matched is None:
-            return None, None, False
-        return str(matched.get("id") or ""), parent_id, bool(matched.get("is_dir"))
+    def delete_files(self, account_id: int, file_ids: List[str], parent_id: str = "") -> bool:
+        payload = self._request("DELETE", "/files/delete", json={
+            "account_id": account_id, "file_ids": file_ids, "parent_id": parent_id or ""})
+        return bool(payload.get("success"))
 
-    def copy_files(self, account_id: int, file_id: str,
-                   target_parent_id: str, source_parent_id: str) -> bool:
-        """同账号复制：网盘侧 copy_file（服务端执行，不经客户端搬数据）。"""
+    def move_files(self, account_id: int, file_ids: List[str], target_parent_id: str,
+                   source_parent_id: str = "") -> bool:
+        """网盘侧移动（不搬数据）。"""
+        payload = self._request("POST", "/files/move", json={
+            "account_id": account_id, "file_ids": file_ids,
+            "target_parent_id": target_parent_id or "", "source_parent_id": source_parent_id or ""})
+        return bool(payload.get("success"))
+
+    def copy_files(self, account_id: int, file_ids: List[str], target_parent_id: str,
+                   source_parent_id: str = "") -> bool:
+        """网盘侧复制（服务端执行，不经客户端搬数据）。"""
         payload = self._request("POST", "/files/copy", json={
-            "account_id": account_id,
-            "file_ids": [file_id],
-            "target_parent_id": target_parent_id,
-            "source_parent_id": source_parent_id,
-        }, timeout=max(self.timeout, 600))
+            "account_id": account_id, "file_ids": file_ids,
+            "target_parent_id": target_parent_id or "", "source_parent_id": source_parent_id or ""})
+        return bool(payload.get("success"))
+
+    def rename_file(self, account_id: int, file_id: str, new_name: str, parent_id: str = "") -> bool:
+        payload = self._request("PUT", "/files/rename", json={
+            "account_id": account_id, "file_id": file_id, "new_name": new_name,
+            "parent_id": parent_id or ""})
         return bool(payload.get("success"))
 
     # -------------------------------------------------------------- 零拷贝上传
