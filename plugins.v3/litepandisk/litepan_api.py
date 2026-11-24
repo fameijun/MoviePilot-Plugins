@@ -172,20 +172,47 @@ class LitePanApi:
         return self._to_file_item(items[0])
 
     def get_folder(self, path) -> Optional[schemas.FileItem]:
+        """确保目录存在并返回目录项。
+
+        先查整条路径，已存在直接返回；不存在时从深到浅找到最高的缺失层级，只对缺失
+        的层级 MKCOL。MoviePilot 一次整理会对同一目标目录调用两次本方法，旧实现逐级
+        MKCOL，而已存在目录的 MKCOL 会让 LitePan 照样向网盘发一次建目录请求。
+        """
         parts = self._parts(str(path))
-        current = ""
-        for seg in parts:
-            current = current + "/" + seg
-            if not self._client.mkcol(current):  # 405=已存在也视为成功
+        if not parts:
+            return self._root_item()
+        item = self.get_item(self._build_path(*parts, is_dir=True))
+        if item is not None:
+            return item if item.type == "dir" else None
+
+        missing: List[str] = []
+        found = 0
+        for end in range(len(parts), 0, -1):
+            if end < len(parts):
+                probe = self.get_item(self._build_path(*parts[:end], is_dir=True))
+                if probe is not None:
+                    if probe.type != "dir":
+                        return None
+                    found = end
+                    break
+            missing.append(parts[end - 1])
+        if not found:
+            return None  # 连账号根目录都查不到，不往下建目录
+        for name in reversed(missing):
+            found += 1
+            if not self._client.mkcol(self._build_path(*parts[:found - 1], name, is_dir=True)):
                 return None
-        target = self._build_path(*parts, is_dir=True)
-        return self.get_item(target)
+        return self.get_item(self._build_path(*parts, is_dir=True))
 
     def create_folder(self, fileitem: schemas.FileItem, name: str) -> Optional[schemas.FileItem]:
         parts = self._parts(fileitem.path)
-        if not parts or not str(name).strip():
+        name = str(name).strip()
+        if not parts or not name:
             return None
-        target = self._build_path(*parts, str(name).strip(), is_dir=True)
+        target = self._build_path(*parts, name, is_dir=True)
+        existing = self.get_item(target)  # 同名目录已存在时直接复用，不再让网盘重复创建
+        if existing is not None:
+            return existing if existing.type == "dir" else None
         if not self._client.mkcol(target):
             return None
         return self.get_item(target)

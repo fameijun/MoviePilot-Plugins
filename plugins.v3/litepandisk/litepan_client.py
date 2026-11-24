@@ -13,6 +13,13 @@ from urllib.parse import quote, unquote, urlsplit
 
 import requests
 
+try:
+    from app.sdk.logging import logger
+except ImportError:
+    import logging
+
+    logger = logging.getLogger(__name__)
+
 DAV_NS = "{DAV:}"
 # 终态：与 litepan upload 包的状态常量对齐。
 UPLOAD_TERMINAL_STATUS = {"success", "failed", "canceled", "skipped"}
@@ -73,13 +80,38 @@ class LitePanClient:
             path = path[len(prefix):]
         return path or "/"
 
+    # ------------------------------------------------------------- 请求与耗时
+    # 元数据/写操作请求全部记 DEBUG 耗时，超过 slow_request_seconds 的另记一条 INFO，
+    # 这样从 MoviePilot 日志就能直接看出一次整理慢在哪个请求上。
+    slow_request_seconds = 3.0
+
+    def _dav_request(self, method: str, path: str, **kwargs) -> requests.Response:
+        started = time.monotonic()
+        try:
+            resp = self.session.request(method, self._url(path), **kwargs)
+        except requests.RequestException:
+            self._log_dav_timing(method, path, started, None)
+            raise
+        self._log_dav_timing(method, path, started, resp.status_code)
+        return resp
+
+    def _log_dav_timing(self, method: str, path: str, started: float, status: Optional[int]):
+        if logger is None:
+            return
+        elapsed = time.monotonic() - started
+        line = (f"【LitePan】{method} {self.normalize_path(path)} "
+                f"{status if status is not None else '网络错误'} 耗时 {elapsed:.2f}s")
+        if elapsed >= self.slow_request_seconds:
+            logger.info(line)
+        else:
+            logger.debug(line)
+
     # -------------------------------------------------------------- PROPFIND
     def propfind(self, path: str, depth: int = 0) -> Tuple[Optional[List[DavItem]], Optional[int]]:
         """返回 (items, status)：200 → items（含自身）；404 → (None, 404)；其它 → (None, code)。"""
-        url = self._url(path)
         try:
-            resp = self.session.request(
-                "PROPFIND", url,
+            resp = self._dav_request(
+                "PROPFIND", path,
                 headers={"Depth": str(depth), "Content-Type": "application/xml"},
                 data='<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop>'
                      '<D:displayname/><D:resourcetype/><D:getcontentlength/>'
@@ -131,14 +163,14 @@ class LitePanClient:
     # ----------------------------------------------------------------- 写操作
     def mkcol(self, path: str) -> bool:
         try:
-            resp = self.session.request("MKCOL", self._url(path), timeout=self.timeout)
+            resp = self._dav_request("MKCOL", path, timeout=self.timeout)
         except requests.RequestException:
             return False
-        return resp.status_code in (200, 201, 405)  # 405=已存在
+        return resp.status_code in (200, 201, 405)  # 405=已存在（LitePan 对建目录出错也回 405）
 
     def delete(self, path: str) -> bool:
         try:
-            resp = self.session.request("DELETE", self._url(path), timeout=self.timeout)
+            resp = self._dav_request("DELETE", path, timeout=self.timeout)
         except requests.RequestException:
             return False
         return resp.status_code in (200, 204, 404)
@@ -147,8 +179,7 @@ class LitePanClient:
         """同账号 MOVE（网盘侧 rename/move API，不搬数据）。dst 已存在时不覆盖（412）。"""
         headers = {"Destination": self._url(dst), "Overwrite": "F"}
         try:
-            resp = self.session.request(
-                "MOVE", self._url(src), headers=headers, timeout=self.timeout)
+            resp = self._dav_request("MOVE", src, headers=headers, timeout=self.timeout)
         except requests.RequestException:
             return False
         return resp.status_code in (200, 201, 204)
