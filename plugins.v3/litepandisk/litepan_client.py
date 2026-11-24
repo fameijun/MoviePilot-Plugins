@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote
 
 import requests
@@ -22,6 +22,8 @@ except ImportError:
 
 # 终态：与 litepan upload 包的状态常量对齐。
 UPLOAD_TERMINAL_STATUS = {"success", "failed", "canceled", "skipped"}
+# 提交上传后，等 LitePan 把上传任务建出来的时间上限（秒）。
+UPLOAD_APPEAR_SECONDS = 60
 CHUNK_SIZE = 10 * 1024 * 1024
 # 请求耗时全部记 DEBUG，超过该秒数的另记一条 INFO，
 # 这样从 MoviePilot 日志就能直接看出一次整理慢在哪个请求上。
@@ -29,13 +31,55 @@ SLOW_REQUEST_SECONDS = 3.0
 
 
 def log_timing(label: str, elapsed: float):
+    """请求耗时：全部记 DEBUG；超过 SLOW_REQUEST_SECONDS 的另记一条 INFO。"""
     if logger is None:
         return
     line = f"【LitePan】{label} 耗时 {elapsed:.2f}s"
+    logger.debug(line)
     if elapsed >= SLOW_REQUEST_SECONDS:
         logger.info(line)
-    else:
-        logger.debug(line)
+
+
+def human_size(num) -> str:
+    """字节数 → 人看的大小（1024 进制）。"""
+    try:
+        value = float(num)
+    except (TypeError, ValueError):
+        return "?"
+    if value < 0:
+        return "?"
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if value < 1024 or unit == "PB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{value:.2f} PB"
+
+
+def _describe_target(kwargs: Dict[str, Any]) -> str:
+    """给请求日志补上操作对象：列的是哪个目录、改名改成什么、移动了几个文件。"""
+    params = kwargs.get("params")
+    if isinstance(params, dict):
+        parts = []
+        for key in ("account_id", "parent_id", "file_id"):
+            if params.get(key) not in (None, ""):
+                parts.append(f"{key}={str(params[key])[:48]}")
+        return " ".join(parts)
+    body = kwargs.get("json")
+    if not isinstance(body, dict):
+        return ""
+    parts = []
+    for key in ("name", "new_name"):
+        if body.get(key):
+            parts.append(f"{key}={body[key]}")
+    if isinstance(body.get("file_ids"), list):
+        parts.append(f"{len(body['file_ids'])} 个文件")
+    if isinstance(body.get("items"), list):
+        parts.append(f"{len(body['items'])} 项")
+    return " ".join(parts)
+
+
+class UploadTasksError(Exception):
+    """LitePan 没把上传任务建出来（或没建全）。异常文本就是给用户看的原因。"""
 
 
 def _new_session() -> requests.Session:
@@ -110,12 +154,14 @@ class LitePanClient:
     # ------------------------------------------------------------- 请求与耗时
     def _dav_request(self, method: str, path: str, **kwargs) -> requests.Response:
         started = time.monotonic()
+        target = self.normalize_path(path)
         try:
             resp = self.session.request(method, self._url(path), **kwargs)
-        except requests.RequestException:
-            log_timing(f"{method} {self.normalize_path(path)} 网络错误", time.monotonic() - started)
+        except requests.RequestException as err:
+            log_timing(f"WebDAV {method} {target} 网络错误({type(err).__name__})", time.monotonic() - started)
             raise
-        log_timing(f"{method} {self.normalize_path(path)} {resp.status_code}", time.monotonic() - started)
+        note = "成功" if resp.status_code < 400 else f"失败 HTTP {resp.status_code}"
+        log_timing(f"WebDAV {method} {target} {note}", time.monotonic() - started)
         return resp
 
     # ----------------------------------------------------------------- 写操作
@@ -217,6 +263,8 @@ class LitePanAdmin:
         except ValueError:
             return False
         self._logged_in = bool(payload.get("success"))
+        if self._logged_in and logger is not None:
+            logger.info(f"【LitePan】已登录 {self.base_url[:-4]}（管理员 {self.username}）")
         return self._logged_in
 
     def _request(self, method: str, path: str, **kwargs) -> Dict[str, Any]:
@@ -225,7 +273,9 @@ class LitePanAdmin:
         kwargs.setdefault("timeout", self.timeout)
         started = time.monotonic()
         payload = self._request_with_relogin(method, url, **kwargs)
-        log_timing(f"{method} /api{path} {'成功' if payload.get('success') else '失败'}",
+        outcome = "成功" if payload.get("success") else f"失败({payload.get('message')})"
+        target = _describe_target(kwargs)
+        log_timing(f"{method} /api{path}{(' ' + target) if target else ''} {outcome}",
                    time.monotonic() - started)
         return payload
 
@@ -313,32 +363,66 @@ class LitePanAdmin:
         }
         return self._request("POST", "/admin/tools/local-upload/upload-path", json=payload)
 
-    def list_upload_tasks(self) -> List[Dict[str, Any]]:
-        payload = self._request("GET", "/files/upload/tasks", params={"limit": 200})
+    def list_upload_tasks(self, account_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """全部上传任务（LitePan 不分页，按账号过滤可以少传一些）。"""
+        payload = self._request("GET", "/files/upload/tasks",
+                                params={"account_id": account_id} if account_id else None)
         if not payload.get("success"):
             return []
         data = payload.get("data")
         return data if isinstance(data, list) else []
 
-    def wait_upload_task(self, client_task_id: str, timeout_seconds: int,
-                         interval: float = 3.0) -> Optional[Dict[str, Any]]:
-        """轮询匹配的任务至终态；超时返回 None。
+    def wait_upload_tasks(self, client_task_id: str, timeout_seconds: int,
+                          on_update: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+                          interval: float = 3.0, expected: Optional[int] = None,
+                          account_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """轮询一批上传任务，等它们全部进入终态后返回这批任务的最终状态。
 
-        LitePan 会给任务 client_task_id 追加序号（xxx-0），batch_id 保留原值，
+        LitePan 会给任务 client_task_id 追加序号（xxx-0、xxx-1 …），batch_id 保留原值，
         因此按 batch_id 精确匹配 + client_task_id 前缀匹配双重兜底。
+
+        on_update 在每次轮询后带着这批任务的当前快照调用一次（用来打进度日志）。
+        expected 是这批应有的任务数（上传接口返回的 count）：没到齐就不算结束。
+        超过 timeout_seconds 抛 TimeoutError；LitePan 没把任务建出来（或没建全）抛 UploadTasksError。
         """
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            for task in self.list_upload_tasks():
+        started = time.time()
+        deadline = started + timeout_seconds
+        grown_at = started      # 最近一次「看到的任务数变多」的时刻
+        count = 0
+        last_seen: List[Dict[str, Any]] = []
+        while True:
+            matched: Dict[str, Dict[str, Any]] = {}
+            for task in self.list_upload_tasks(account_id):
                 task_cid = str(task.get("client_task_id") or "")
                 if task.get("batch_id") == client_task_id or task_cid == client_task_id \
                         or task_cid.startswith(client_task_id + "-"):
-                    status = str(task.get("status") or "")
-                    if status in UPLOAD_TERMINAL_STATUS:
-                        return task
-                    break
+                    matched[str(task.get("task_id"))] = task
+            if len(matched) >= count:
+                last_seen = list(matched.values())
+            if len(matched) > count:
+                count, grown_at = len(matched), time.time()
+            if matched and on_update is not None:
+                on_update(list(matched.values()))
+            now = time.time()
+            if matched and all(str(t.get("status") or "") in UPLOAD_TERMINAL_STATUS
+                               for t in matched.values()):
+                if expected is None or count >= expected:
+                    return list(matched.values())
+                # 看到的都已结束、但数量不够：再等一会儿，看剩下的任务会不会建出来
+                if now - grown_at > UPLOAD_APPEAR_SECONDS:
+                    raise UploadTasksError(
+                        f"LitePan 只创建了 {count}/{expected} 个上传任务，其余的没有建出来"
+                        "（原因见 LitePan 的日志和通知）")
+            elif count == 0:
+                if now - started > UPLOAD_APPEAR_SECONDS:
+                    raise UploadTasksError(
+                        "提交后 LitePan 一直没有创建出上传任务（原因见 LitePan 的日志和通知）")
+            elif not matched and last_seen and now - grown_at > UPLOAD_APPEAR_SECONDS:
+                # 任务从列表里消失了（比如在 LitePan 面板里被清理）：用最后一次看到的快照
+                return last_seen
+            if now >= deadline:
+                raise TimeoutError()
             time.sleep(interval)
-        return None
 
     @staticmethod
     def new_task_id() -> str:
